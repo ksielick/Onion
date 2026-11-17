@@ -35,10 +35,12 @@
 #define DB_CHECK_INTERVAL_MS 15000
 #define DB_SETTLE_MS 1000
 
-// After a wake from sleep (a gap of more than WAKE_GAP_MS between loop passes), check
-// every DB_FAST_CHECK_INTERVAL_MS for WAKE_FAST_CHECK_MS: batmon reads the battery
-// within its 15 s cycle after the wake
-#define WAKE_GAP_MS 2000
+// After a wake from sleep (SIGCONT, or a gap of more than WAKE_GAP_MS between loop passes),
+// check every DB_FAST_CHECK_INTERVAL_MS for WAKE_FAST_CHECK_MS: batmon reads the battery
+// within its 15 s cycle after the wake. The gap is only a fallback for a missed SIGCONT: a slow
+// pass (the log database, cpuclock, the battery test loading both cores) takes seconds, and the
+// 2 s used before aborted the battery test with "Interrupted by sleep" (review point 7).
+#define WAKE_GAP_MS 30000
 #define WAKE_FAST_CHECK_MS 30000
 #define DB_FAST_CHECK_INTERVAL_MS 1000
 
@@ -113,9 +115,6 @@
 #define GRAPH_MIN_SESSION_FOR_ESTIMATION 1200
 #define GRAPH_MAX_PLAUSIBLE_ESTIMATION 54000
 #define GRAPH_ESTIMATED_LINE_GAP 20
-// Most a newest row's live clock time may exceed its logged duration: batmon's
-// 10 min rewrite interval plus room for a late tick; beyond it the clock jumped.
-#define LIVE_ELAPSED_MAX_GAP_S (15 * 60)
 
 #define LABEL_Y 410
 

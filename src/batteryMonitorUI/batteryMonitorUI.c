@@ -648,6 +648,30 @@ bool read_battery_voltage(void)
     return true;
 }
 
+// batmon adds the awake seconds to the newest entry when its level changes and otherwise every
+// MAX_DURATION_BEFORE_UPDATE (600) seconds awake; it is stopped while asleep. So the time since it
+// last wrote the log is awake time only up to that limit (plus its loop's slack); a longer span
+// holds a sleep or a power-off, which must stay out of the session time and the graph.
+#define BATMON_MAX_UNWRITTEN_S 630
+
+// The newest entry's duration with the awake time batmon has not written yet.
+static int live_duration(int duration, long long now, long long log_mtime)
+{
+    if (log_mtime <= 0 || now <= log_mtime)
+        return duration;
+    long long unwritten = now - log_mtime;
+    if (unwritten > BATMON_MAX_UNWRITTEN_S)
+        unwritten = BATMON_MAX_UNWRITTEN_S;
+    return duration + (int)unwritten;
+}
+
+// A wake from sleep: Onion's sleep stops the app (SIGSTOP) and continues it (SIGCONT). A gap
+// between loop passes longer than WAKE_GAP_MS counts too, in case the signal was missed.
+static int is_wake(int sigcont, int gap_ms)
+{
+    return sigcont || gap_ms > WAKE_GAP_MS;
+}
+
 void compute_graph(void)
 {
     int total_duration = 0;
@@ -714,17 +738,14 @@ void compute_graph(void)
                     }
 
                     // For the newest row, batmon only writes duration upon percentage change or every 10 min.
-                    // Advance duration with live elapsed awake time so SESSION updates smoothly on the fly.
-                    // batmon rewrites the newest row at least every MAX_DURATION_BEFORE_UPDATE
-                    // (10 min) while awake, so a clock gap far beyond that is not time spent at
-                    // this level: the clock moved under the row. A row begun before the time
-                    // sync (fallback clock, ~4 years behind) gave SESSION 35064h03 and an empty
-                    // graph right after an update, until batmon logged the next level (tester
-                    // report, 4.5.1 beta 1). Then keep batmon's own duration.
-                    if (first_row && !is_charging && row_time > 0 && newer_row_time > row_time) {
-                        long long live_elapsed = newer_row_time - row_time;
-                        if (live_elapsed > duration && live_elapsed <= (long long)duration + LIVE_ELAPSED_MAX_GAP_S)
-                            duration = (int)live_elapsed;
+                    // Advance duration with the awake time it has not written yet (since the log file's
+                    // mtime, at most BATMON_MAX_UNWRITTEN_S), so SESSION updates on the fly. Not the clock
+                    // since the entry began: that holds every sleep since then (review point 6), and a
+                    // clock that jumped (time sync after boot) adds at most the cap.
+                    if (first_row && !is_charging) {
+                        struct stat st;
+                        if (stat(BATTERY_LOG_FILE, &st) == 0)
+                            duration = live_duration(duration, newer_row_time, (long long)st.st_mtime);
                     }
 
                     first_row = false;
@@ -890,11 +911,13 @@ void compute_graph(void)
                     // end and the newer entry's start (batmon is stopped while asleep, so
                     // its duration leaves the sleep out). The level lost across the gap is
                     // what the sleep cost: batmon reads the battery at once on wake.
-                    if (run_rows > 0 && !is_charging && row_time > 0 && newer_row_time > 0) {
+                    // The newest entry: the gap up to now is a sleep going on at its level, so it
+                    // counts in the time asleep; its cost shows when the next level is logged.
+                    if (!is_charging && row_time > 0 && newer_row_time > 0) {
                         long long gap = newer_row_time - row_time - duration;
                         if (gap >= SLEEP_GAP_MIN && gap * 100 >= (long long)duration * SLEEP_GAP_MIN_PCT) {
                             run_sleep += gap;
-                            if (raw_level <= 100 && newer_row_level <= 100 && raw_level > newer_row_level)
+                            if (run_rows > 0 && raw_level <= 100 && newer_row_level <= 100 && raw_level > newer_row_level)
                                 run_sleep_drop += raw_level - newer_row_level;
                         }
                     }
@@ -1460,25 +1483,85 @@ static bool bt_set_mhz(int mhz)
     return system(cmd) == 0;
 }
 
+static void bt_write_governor(const char *gov)
+{
+    if (gov[0] == '\0')
+        return;
+    FILE *fp = fopen(BT_GOVERNOR_FILE, "w");
+    if (fp != NULL) {
+        fputs(gov, fp);
+        fclose(fp);
+    }
+}
+
+// What the battery test changes (clock, governor, brightness), saved in RAM before it changes
+// anything. bt_restore() puts it back on every way out the app sees; a SIGKILL skips that
+// (review point 8), so launch.sh runs "batteryMonitorUI --restore" after the app ends, and the
+// app restores at start.
+#define BT_STATE_FILE "/tmp/batterymonitor_bt_restore"
+
+static int bt_format_state(char *buf, size_t len, int mhz, const char *gov, unsigned brightness)
+{
+    return snprintf(buf, len, "%d %s %u\n", mhz, gov[0] != '\0' ? gov : "-", brightness);
+}
+
+// Returns 0 when the line holds a clock, a governor ("-" for none) and a brightness.
+static int bt_parse_state(const char *line, int *mhz, char *gov, size_t gov_len, unsigned *brightness)
+{
+    char g[32];
+    if (sscanf(line, "%d %31s %u", mhz, g, brightness) != 3)
+        return -1;
+    if (*mhz < 100 || *mhz > 2400)
+        return -1;
+    snprintf(gov, gov_len, "%s", strcmp(g, "-") == 0 ? "" : g);
+    return 0;
+}
+
+static void bt_save_state(void)
+{
+    char line[64];
+    bt_format_state(line, sizeof(line), bt.saved_mhz, bt.saved_gov, bt.saved_brightness);
+    FILE *fp = fopen(BT_STATE_FILE, "w");
+    if (fp != NULL) {
+        fputs(line, fp);
+        fclose(fp);
+    }
+}
+
+// After a battery test the app did not end itself (SIGKILL): put back what the file holds.
+static void bt_restore_from_file(void)
+{
+    char line[64], gov[32];
+    int mhz;
+    unsigned brightness;
+    FILE *fp = fopen(BT_STATE_FILE, "r");
+    if (fp == NULL)
+        return;
+    bool read = fgets(line, sizeof(line), fp) != NULL;
+    fclose(fp);
+    unlink(BT_STATE_FILE);
+    if (!read || bt_parse_state(line, &mhz, gov, sizeof(gov), &brightness) != 0)
+        return;
+    bt_set_mhz(mhz);
+    bt_write_governor(gov);
+    if (brightness > 0)
+        display_setBrightnessRaw(brightness);
+}
+
 static void bt_restore(void)
 {
     bt_stop_load();
     if (bt.clock_changed) {
         if (bt.saved_mhz > 0)
             bt_set_mhz(bt.saved_mhz);
-        if (bt.saved_gov[0] != '\0') {
-            FILE *fp = fopen(BT_GOVERNOR_FILE, "w");
-            if (fp != NULL) {
-                fputs(bt.saved_gov, fp);
-                fclose(fp);
-            }
-        }
+        bt_write_governor(bt.saved_gov);
         bt.clock_changed = false;
     }
     if (bt.brightness_changed) {
         display_setBrightnessRaw(bt.saved_brightness);
         bt.brightness_changed = false;
     }
+    unlink(BT_STATE_FILE);
 }
 
 static void bt_abort(const char *reason)
@@ -1572,6 +1655,7 @@ static void bt_start(Uint32 now)
     }
 
     bt.saved_brightness = display_getBrightnessRaw();
+    bt_save_state(); // before anything changes
     bt.brightness_changed = true;
     display_setBrightnessRaw(BT_DIM_RAW);
 
@@ -2416,6 +2500,11 @@ void renderPage()
 
 int main(int argc, char *argv[])
 {
+    // a battery test the app did not end itself (SIGKILL) left its clock and brightness: launch.sh
+    // runs "--restore" after the app ends, and any start restores too
+    bt_restore_from_file();
+    if (argc > 1 && strcmp(argv[1], "--restore") == 0)
+        return 0;
     init();
     signal(SIGCONT, sigcont_handler);
     atexit(bt_restore);
@@ -2452,7 +2541,7 @@ int main(int argc, char *argv[])
         // Onion's sleep stops every process (SIGSTOP) and continues them on wake, batmon
         // included, which then reads the battery at its next 15 s check. A long gap
         // between passes or SIGCONT means we were stopped: query AXP223 immediately and recompute.
-        if (sigcont_received || (Sint32)(now - last_pass) > WAKE_GAP_MS) {
+        if (is_wake(sigcont_received, (Sint32)(now - last_pass))) {
             sigcont_received = 0;
             if (bt.state == BT_RUNNING)
                 bt_abort("Interrupted by sleep");

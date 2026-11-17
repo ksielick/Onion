@@ -34,6 +34,8 @@ TESTS += test_mainui_flags test_footer_layout test_gs_bottom_bar test_mainui_sho
 TESTS += test_gs_recent_list test_gs_game_name test_gs_state_copy
 # Tweaks: resets, diagnostics status, Samba shares
 TESTS += test_tweaks_reset test_tweaks_diags test_tweaks_smb
+# Battery Monitor: review points 6-8 of PR #332, cut from the real source
+TESTS += test_batterymonitor_review
 # Package Manager: install script, list moves
 TESTS += test_pacman_install
 # Theme Switcher: fixed MainUI images, compact themes
@@ -428,6 +430,24 @@ test_signal_handler: $(BUILD_DIR)/test_signal_handler
 $(BUILD_DIR)/test_signal_handler: test_signal_handler.c onion_test.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ test_signal_handler.c $(LDFLAGS)
+
+test_batterymonitor_review: $(BUILD_DIR)/test_batterymonitor_review
+	@echo ""
+	@$(BUILD_DIR)/test_batterymonitor_review
+
+# Battery Monitor's functions for review points 6-8, cut from the real source.
+$(BUILD_DIR)/batterymonitor_review_fns.c: ../src/batteryMonitorUI/batteryMonitorUI.c ../src/batteryMonitorUI/batteryMonitorUI.h
+	@mkdir -p $(BUILD_DIR)
+	grep -E '^#define BATMON_MAX_UNWRITTEN_S' ../src/batteryMonitorUI/batteryMonitorUI.c > $@
+	grep -E '^#define WAKE_GAP_MS' ../src/batteryMonitorUI/batteryMonitorUI.h >> $@
+	sed -n '/^static int live_duration(/,/^}/p' ../src/batteryMonitorUI/batteryMonitorUI.c >> $@
+	sed -n '/^static int is_wake(/,/^}/p' ../src/batteryMonitorUI/batteryMonitorUI.c >> $@
+	sed -n '/^static int bt_format_state(/,/^}/p' ../src/batteryMonitorUI/batteryMonitorUI.c >> $@
+	sed -n '/^static int bt_parse_state(/,/^}/p' ../src/batteryMonitorUI/batteryMonitorUI.c >> $@
+
+$(BUILD_DIR)/test_batterymonitor_review: test_batterymonitor_review.c onion_test.h $(BUILD_DIR)/batterymonitor_review_fns.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DREVIEW_FNS='"$(abspath $(BUILD_DIR))/batterymonitor_review_fns.c"' -o $@ test_batterymonitor_review.c $(LDFLAGS)
 
 test_battery: $(BUILD_DIR)/test_battery
 	@echo ""
